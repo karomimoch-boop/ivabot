@@ -1,40 +1,191 @@
-import requests
 import re
 import json
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 import os
-from telegram import Bot
-from telegram.ext import Application, CommandHandler
+from telegram import Bot, Update
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+import undetected_chromedriver as uc
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
 import asyncio
-from playsound import playsound
-from plyer import notification
-import urllib.parse
 
-# Load environment variables
 load_dotenv()
+
 IVASMS_EMAIL = os.getenv("IVASMS_EMAIL")
 IVASMS_PASSWORD = os.getenv("IVASMS_PASSWORD")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
-# Common headers
-BASE_HEADERS = {
-    "Host": "www.ivasms.com",
-    "Cache-Control": "max-age=0",
-    "Sec-Ch-Ua": '"Not)A;Brand";v="8", "Chromium";v="138"',
-    "Sec-Ch-Ua-Mobile": "?0",
-    "Sec-Ch-Ua-Platform": '"Windows"',
-    "Upgrade-Insecure-Requests": "1",
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
-    "Sec-Fetch-Site": "none",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-User": "?1",
-    "Sec-Fetch-Dest": "document",
-    "Accept-Encoding": "gzip, deflate, br",
+last_check = "Belum pernah cek"
+seen_sms_ids = set() # buat nyimpen SMS yang udah dikirim biar gak spam
+
+async def send_to_telegram(sms):
+    bot = Bot(token=BOT_TOKEN)
+    message = f"📩 SMS BARU MASUK!\n\n⏰ {sms['timestamp']}\n📞 Dari: +{sms['number']}\n📦 Range: {sms['range']}\n💬 Isi: {sms['message']}\n💰 Revenue: ${sms['revenue']}"
+    try:
+        await bot.send_message(chat_id=CHAT_ID, text=message)
+        print(f"✅ Terkirim: {sms['number']} - {sms['message'][:30]}...")
+    except Exception as e:
+        print(f"❌ Gagal kirim Telegram: {e}")
+
+def get_driver_and_login():
+    options = uc.ChromeOptions()
+    options.add_argument('--headless=new')
+    options.add_argument('--no-sandbox')
+    options.add_argument('--disable-dev-shm-usage')
+    options.add_argument('--window-size=1920,1080')
+
+    print("[1/5] Buka browser...")
+    driver = uc.Chrome(options=options, version_main=None)
+
+    print("[2/5] Login ivasms.com...")
+    driver.get("https://www.ivasms.com/login")
+    time.sleep(3)
+
+    WebDriverWait(driver, 20).until(EC.presence_of_element_located((By.NAME, "email")))
+    driver.find_element(By.NAME, "email").send_keys(IVASMS_EMAIL)
+    driver.find_element(By.NAME, "password").send_keys(IVASMS_PASSWORD)
+    driver.find_element(By.CSS_SELECTOR, 'button[type="submit"]').click()
+    time.sleep(5)
+
+    if "login" in driver.current_url:
+        driver.quit()
+        raise Exception("Login gagal! Cek.env")
+
+    print("✅ Login berhasil!")
+    return driver
+
+def parse_sms_from_page(driver, range_name, revenue):
+    """Ambil semua SMS yang ada di halaman sekarang"""
+    try:
+        soup = BeautifulSoup(driver.page_source, 'html.parser')
+        sms_list = []
+
+        # Ivasms biasanya pake table atau div.sms-row
+        rows = soup.find_all('tr', class_=re.compile(r'sms|row'))
+        if not rows:
+            rows = soup.find_all('div', class_='sms-row')
+
+        for row in rows:
+            try:
+                cols = row.find_all(['td', 'div'])
+                if len(cols) < 3:
+                    continue
+
+                # Format umum: [checkbox] [number] [message] [time] [action]
+                number = cols[1].text.strip().replace('+', '').replace(' ', '')
+                message = cols[2].text.strip()
+                timestamp = cols[3].text.strip() if len(cols) > 3 else datetime.now().strftime("%H:%M:%S")
+
+                # Bikin ID unik biar gak spam
+                sms_id = f"{number}_{message[:20]}_{timestamp}"
+
+                sms_list.append({
+                    'id': sms_id,
+                    'number': number,
+                    'message': message,
+                    'timestamp': timestamp,
+                    'range': range_name,
+                    'revenue': revenue
+                })
+            except:
+                continue
+
+        return sms_list
+    except Exception as e:
+        print(f"Error parse SMS: {e}")
+        return []
+
+def parse_ranges(driver):
+    """Ambil semua range + revenue"""
+    soup = BeautifulSoup(driver.page_source, 'html.parser')
+    ranges = []
+    cards = soup.find_all('div', class_='card card-body mb-1 pointer')
+
+    for card in cards:
+        try:
+            cols = card.find_all('div', class_=re.compile(r'col-sm-\d+|col-\d+'))
+            if len(cols) >= 5:
+                range_name = cols[0].text.strip()
+                revenue_span = cols[4].find('span', class_='currency_cdr')
+                revenue = float(revenue_span.text.strip() or 0.0)
+                onclick = card.get('onclick', '')
+                range_id_match = re.search(r"getDetials\('([^']+)'\)", onclick)
+                range_id = range_id_match.group(1) if range_id_match else range_name
+                ranges.append({"range_name": range_name, "range_id": range_id, "revenue": revenue})
+        except:
+            continue
+    return ranges
+
+async def monitoring_loop():
+    global last_check, seen_sms_ids
+    loop = asyncio.get_event_loop()
+
+    driver = await loop.run_in_executor(None, get_driver_and_login)
+
+    while True:
+        try:
+            driver.get("https://www.ivasms.com/portal/sms/received")
+            time.sleep(3)
+
+            ranges = parse_ranges(driver)
+            new_sms_count = 0
+
+            for r in ranges:
+                # Klik tiap range buat load SMS nya
+                try:
+                    driver.execute_script(f"getDetials('{r['range_id']}')")
+                    time.sleep(2)
+                    WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.TAG_NAME, "tr")))
+
+                    sms_list = parse_sms_from_page(driver, r['range_name'], r['revenue'])
+
+                    for sms in sms_list:
+                        if sms['id'] not in seen_sms_ids:
+                            seen_sms_ids.add(sms['id'])
+                            await send_to_telegram(sms)
+                            new_sms_count += 1
+
+                except Exception as e:
+                    print(f"Skip range {r['range_name']}: {e}")
+                    continue
+
+            last_check = datetime.now().strftime("%H:%M:%S")
+            if new_sms_count > 0:
+                print(f"[{last_check}] Kirim {new_sms_count} SMS baru")
+            else:
+                print(f"[{last_check}] Cek... belum ada SMS baru")
+
+            await asyncio.sleep(10) # cek tiap 10 detik
+
+        except Exception as e:
+            print(f"Error loop: {e}")
+            await asyncio.sleep(30)
+
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🔥 IVASMS Bot Online!\n\nBot ini bakal kirim SEMUA SMS yang masuk ke ivasms.com\n/status - Cek status\n")
+
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global last_check
+    await update.message.reply_text(f"📊 Status Bot:\nMonitoring: Aktif ✅\nLast Check: {last_check}\nTotal SMS terbaca: {len(seen_sms_ids)}")
+
+def main():
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("status", status_command))
+
+    loop = asyncio.get_event_loop()
+    loop.create_task(monitoring_loop())
+
+    print("Bot jalan... Kirim /start ke bot Telegram lu buat test")
+    app.run_polling(close_loop=False)
+
+if __name__ == "__main__":
+    main()    "Accept-Encoding": "gzip, deflate, br",
     "Accept-Language": "en-GB,en;q=0.9",
     "Priority": "u=0, i",
     "Connection": "keep-alive"
